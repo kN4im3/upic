@@ -133,32 +133,22 @@ Java.perform(function () {
         return;
     }
 
-    // 1) 把 App 显式设置的写死代理吃掉，防止它覆盖我们的 ProxySelector。
-    try {
-        Builder.proxy.implementation = function (p) {
-            log('拦截 Builder.proxy(' + p + ')，忽略 App 写死的代理，改用 ProxySelector');
-            return this; // 不调用原始方法，相当于不设置 proxy 字段
-        };
-    } catch (e) {
-        console.log('[okhttp-proxy] Hook Builder.proxy 失败: ' + e);
-    }
-
-    // 2) 拦截 App 自己设置的 proxySelector，统一换成我们的。
-    try {
-        Builder.proxySelector.implementation = function (ps) {
-            log('拦截 Builder.proxySelector(...)，替换为 ForceProxySelector');
-            return this.proxySelector(selectorInstance);
-        };
-    } catch (e) {
-        console.log('[okhttp-proxy] Hook Builder.proxySelector 失败: ' + e);
-    }
-
-    // 3) 在 build() 时强制注入我们的 ProxySelector（覆盖那些既没调 proxy 也没调
-    //    proxySelector 的默认客户端）。
+    // 只 Hook build()，把侵入性降到最低：
+    //   - 这里不再单独 Hook proxy()/proxySelector() 两个 setter，避免日志刷屏，
+    //     也减少对 App 启动流程的干扰。
+    //   - build() 是 Builder 的最后一步，在这里设置一定能覆盖 App 之前的设置。
+    //   - this.proxy(null)/this.proxySelector(...) 此时调用的是“原始 setter”
+    //     （它们没有被 Hook），不存在递归。
+    //   - this.build() 在 build 的 implementation 内调用，Frida 会自动转发到
+    //     “原始 build”，不会无限递归。
     try {
         Builder.build.implementation = function () {
             try {
-                // 这里直接调原始 setter，避免触发上面被 Hook 的 proxySelector 实现。
+                this.proxy(null);                 // 清掉 App 写死的代理，否则会优先于 proxySelector
+            } catch (e) {
+                log('build() 中清理 proxy 失败(可忽略): ' + e);
+            }
+            try {
                 this.proxySelector(selectorInstance);
             } catch (e) {
                 log('build() 中注入 proxySelector 失败: ' + e);
