@@ -79,15 +79,10 @@ Java.perform(function () {
         return false;
     }
 
-    // 预先构造好两类代理对象，避免每次 select 都重新创建。
-    var DIRECT = Proxy.NO_PROXY.value; // 直连
-    var HTTP_PROXY;
-    try {
-        var sockAddr = InetSocketAddress.$new(PROXY_HOST, PROXY_PORT);
-        HTTP_PROXY = Proxy.$new(ProxyType.HTTP.value, sockAddr);
-    } catch (e) {
-        console.log('[okhttp-proxy] 构造代理对象失败: ' + e);
-    }
+    // 注意：不要在这里预先创建 Proxy/InetSocketAddress 实例再缓存到全局变量。
+    // select()/build() 会在 App 的网络线程上被回调，跨线程使用之前缓存的
+    // Java 实例引用会失效，导致 JNI 崩溃（表现为 "Process terminated"）。
+    // 正确做法是：在回调内部、当前线程上现场创建这些对象。
 
     // 自定义 ProxySelector：本地回环走直连，其余走指定代理。
     var ForceProxySelector = Java.registerClass({
@@ -95,18 +90,27 @@ Java.perform(function () {
         superClass: ProxySelector,
         methods: {
             select: function (uri) {
+                // 全部在当前(回调)线程内现场创建，避免使用失效的跨线程引用。
                 var list = ArrayList.$new();
                 var host = null;
                 try {
                     host = uri.getHost();
                 } catch (e) {}
 
-                if (isLoopbackHost(host)) {
-                    list.add(DIRECT);
-                    log('DIRECT  -> ' + host + '  (本地回环，跳过代理)');
-                } else {
-                    list.add(HTTP_PROXY);
-                    log('PROXY   -> ' + host + '  via ' + PROXY_HOST + ':' + PROXY_PORT);
+                try {
+                    if (isLoopbackHost(host)) {
+                        list.add(Proxy.NO_PROXY.value); // 直连
+                        log('DIRECT  -> ' + host + '  (本地回环，跳过代理)');
+                    } else {
+                        var addr = InetSocketAddress.$new(PROXY_HOST, PROXY_PORT);
+                        var p = Proxy.$new(ProxyType.HTTP.value, addr);
+                        list.add(p);
+                        log('PROXY   -> ' + host + '  via ' + PROXY_HOST + ':' + PROXY_PORT);
+                    }
+                } catch (e) {
+                    // 兜底：出错时直连，避免影响 App 正常运行。
+                    log('select() 构造代理失败，改为直连: ' + e);
+                    try { list.add(Proxy.NO_PROXY.value); } catch (e2) {}
                 }
                 return list;
             },
@@ -116,7 +120,9 @@ Java.perform(function () {
         }
     });
 
-    var selectorInstance = ForceProxySelector.$new();
+    // selectorInstance 会在不同线程的 build() 回调里反复使用，必须 retain，
+    // 否则同样会因为跨线程引用失效而崩溃。
+    var selectorInstance = Java.retain(ForceProxySelector.$new());
 
     var Builder;
     try {
